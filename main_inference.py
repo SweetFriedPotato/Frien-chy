@@ -36,7 +36,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 K_RETRIEVE = 15  # 검색량 증가
 FINAL_TOPK = 7   # 최종 선택량 증가
-MIN_SCORE = float(os.getenv("QDRANT_MIN_SCORE", "0.30"))  # 임계값 조정
+MIN_SCORE = float(os.getenv("QDRANT_MIN_SCORE", "0.45"))  # 임계값 조정
 
 # --------------------
 # Builders
@@ -224,14 +224,14 @@ class SynonymNormalizer:
     - 실패 시: 원문 그대로 반환 (안전한 폴백)
     환경변수:
       - SYNONYMS_DB_URL: 전용 동의어 DB
-      - SYN_FUZZY_LIMIT (기본 5), SYN_FUZZY_THRESHOLD (기본 0.30)
+      - SYN_FUZZY_LIMIT (기본 3), SYN_FUZZY_THRESHOLD (기본 0.25)
       - SYN_EXPAND (true/false, 기본 true): 토큰별 상위 유사어를 괄호 OR 확장
     """
     def __init__(self, db_url: str | None = None):
         self.db_url = db_url or os.getenv("DATABASE_SYN_URL")
-        self.fuzzy_limit = int(os.getenv("SYN_FUZZY_LIMIT", "5"))
+        self.fuzzy_limit = int(os.getenv("SYN_FUZZY_LIMIT", "3"))
         try:
-            self.fuzzy_threshold = float(os.getenv("SYN_FUZZY_THRESHOLD", "0.30"))
+            self.fuzzy_threshold = float(os.getenv("SYN_FUZZY_THRESHOLD", "0.25"))
         except Exception:
             self.fuzzy_threshold = 0.25
         self.expand = (os.getenv("SYN_EXPAND", "true").lower() != "false")
