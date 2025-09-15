@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
 import json
+import langchain
 
 from fastapi.responses import StreamingResponse
 from langgraph.graph import StateGraph, END
@@ -19,6 +20,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.chat_history import BaseChatMessageHistory
+from langchain.cache import SQLiteCache
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -675,6 +677,9 @@ def get_session_history(session_id: str) -> BaseChatMessageHistory:
 
 @app.on_event("startup")
 def on_startup():
+    print("Setting up SQLite cache for LangChain...")
+    langchain.llm_cache = SQLiteCache(database_path="langchain.db")
+    print("Cache setup complete.")
     # DB 연결 테스트
     try:
         test_history = get_session_history("test_connection")
