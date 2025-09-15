@@ -10,7 +10,9 @@ import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
+import json
 
+from fastapi.responses import StreamingResponse
 from langgraph.graph import StateGraph, END
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -496,7 +498,6 @@ class MemoryAwareRAGChain:
         self.get_session_history = get_session_history
         self.contextualize_q_chain = CONTEXTUALIZE_QUESTION_PROMPT | llm_light | StrOutputParser()
         self.context_extractor = ContextExtractor()
-        # 유사어 정규화/확장기 추가
         self.synonym_normalizer = SynonymNormalizer()
 
     def invoke(self, input_data: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
@@ -573,6 +574,70 @@ class MemoryAwareRAGChain:
             "answer": answer,
             "used_docs": [serialize_doc(d) for d in final_docs]
         }
+    
+    # NEW: 스트리밍을 위한 비동기 제너레이터 메소드 추가
+    async def astream_invoke(self, input_data: Dict[str, Any], config: Dict[str, Any]) -> str:
+        """메모리 기능을 포함한 개선된 RAG 처리 (비동기 스트리밍)"""
+        session_id = config.get("configurable", {}).get("session_id")
+        if not session_id:
+            raise ValueError("session_id가 config에 없습니다.")
+
+        question = input_data["question"]
+        history = self.get_session_history(session_id)
+        chat_history = history.messages
+
+        print("=== RAG 스트리밍 처리 시작 ===")
+        print(f"원본 질문: {question}")
+
+        # 1. 답변 생성 전 준비 단계 (여기까지는 스트리밍이 아님)
+        context_info = self.context_extractor.extract_brand_context(chat_history)
+        
+        if chat_history:
+            contextualized_question = self.contextualize_q_chain.invoke(
+                {"question": question, "chat_history": chat_history}
+            )
+        else:
+            contextualized_question = question
+        
+        rewritten_question = self.synonym_normalizer.rewrite(contextualized_question)
+        print(f"재작성된 검색 질문: {rewritten_question}")
+
+        raw_docs = self.retriever.invoke(rewritten_question)
+        final_docs = smart_document_filter(raw_docs, context_info, question)
+        print(f"최종 문서 수: {len(final_docs)}")
+        
+        # 2. 스트리밍 시작: 먼저 '참고 문서' 정보를 전송 (SSE 이벤트 활용)
+        used_docs_json = json.dumps([serialize_doc(d) for d in final_docs], ensure_ascii=False)
+        yield f"event: sources\ndata: {used_docs_json}\n\n"
+
+        # 3. 답변 생성 스트리밍
+        if not final_docs:
+            answer_chunk = "요청하신 정보를 찾을 수 없습니다. 더 구체적인 질문을 해주시면 도움을 드릴 수 있습니다."
+            yield f"data: {json.dumps({'token': answer_chunk})}\n\n"
+            full_answer = answer_chunk
+        else:
+            ctx = concat_context(final_docs)
+            rag_chain = (
+                RunnablePassthrough.assign(context=lambda x: ctx)
+                | ANSWER_PROMPT
+                | self.llm
+                | StrOutputParser()
+            )
+            
+            full_answer = ""
+            # .astream()을 사용하여 비동기적으로 토큰을 받아옵니다.
+            async for chunk in rag_chain.astream({"question": question}):
+                full_answer += chunk
+                # 각 토큰(chunk)을 SSE 형식으로 클라이언트에 yield
+                yield f"data: {json.dumps({'token': chunk})}\n\n"
+
+        # 4. 스트리밍 종료 후 대화 기록 저장
+        history.add_message(HumanMessage(content=question))
+        history.add_message(AIMessage(content=full_answer))
+        print(f"전체 답변 저장 완료: {full_answer}")
+
+        # 5. 스트림의 끝을 알리는 특별 이벤트 전송
+        yield "event: end\ndata: Stream ended\n\n"
 
 # --------------------
 # FastAPI App (기존과 동일하지만 개선된 체인 사용)
@@ -627,35 +692,32 @@ def on_startup():
     app.state.memory_rag_chain = MemoryAwareRAGChain(retriever, llm_light, llm, get_session_history)
     app.state.collection = collection
 
-@app.post("/ask", response_model=AnswerResponse)
-def ask(req: QuestionRequest):
+# ✨ CHANGED: /ask 엔드포인트를 비동기 스트리밍 방식으로 변경
+@app.post("/ask") # ⛔️ response_model=AnswerResponse 제거
+async def ask(req: QuestionRequest): # ✨ async def로 변경
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="질문이 비어 있습니다.")
     if not req.session_id.strip():
         raise HTTPException(status_code=400, detail="session_id가 비어 있습니다.")
-    
+
     try:
         session_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, req.session_id.strip()))
         config = {"configurable": {"session_id": session_uuid}}
-        
-        print(f"세션 ID: {session_uuid}")
-        print(f"질문: {req.question}")
-        
-        result = app.state.memory_rag_chain.invoke(
-            {"question": req.question.strip()},
-            config=config
-        )
-        
-        return AnswerResponse(
-            question=req.question.strip(),
-            answer=result["answer"],
-            used_docs=result["used_docs"],
-            status="success",
-            cfg=CFG_NAME
+
+        # StreamingResponse를 반환합니다.
+        # content는 비동기 제너레이터 함수 호출 그 자체입니다.
+        return StreamingResponse(
+            app.state.memory_rag_chain.astream_invoke(
+                {"question": req.question.strip()},
+                config=config
+            ),
+            media_type="text/event-stream" # ✨ SSE를 위한 media type
         )
     except Exception as e:
         import traceback
         traceback.print_exc()
+        # 스트리밍 오류는 다른 방식으로 처리해야 할 수 있습니다.
+        # 여기서는 간단히 500 에러를 발생시킵니다.
         raise HTTPException(status_code=500, detail=str(e))
 
 # 건강 체크 및 DB 상태 확인 엔드포인트
