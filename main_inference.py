@@ -36,7 +36,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 K_RETRIEVE = 15  # 검색량 증가
 FINAL_TOPK = 7   # 최종 선택량 증가
-MIN_SCORE = float(os.getenv("QDRANT_MIN_SCORE", "0.45"))  # 임계값 하향 조정
+MIN_SCORE = float(os.getenv("QDRANT_MIN_SCORE", "0.30"))  # 임계값 조정
 
 # --------------------
 # Builders
@@ -69,6 +69,13 @@ def build_qdrant_vectorstore(embeddings):
 def build_llm():
     return ChatGoogleGenerativeAI(
         model="gemini-2.5-pro",
+        google_api_key=os.getenv("GEMINI_API_KEY"),
+        temperature=0.1,
+    )
+
+def build_llm_light():
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
         google_api_key=os.getenv("GEMINI_API_KEY"),
         temperature=0.1,
     )
@@ -205,6 +212,135 @@ class ContextExtractor:
         
         return context
 
+
+# --------------------
+# Synonym-based Query Rewriter (새로 추가)
+# --------------------
+class SynonymNormalizer:
+    """
+    질의를 표준어/유사어로 정규화 및 확장하는 유틸.
+    - 우선순위 1: Postgres의 normalize_text(text) 함수가 있으면 그것을 호출
+    - 우선순위 2: synonyms 테이블 + pg_trgm 를 이용해 토큰 단위로 가벼운 확장
+    - 실패 시: 원문 그대로 반환 (안전한 폴백)
+    환경변수:
+      - SYNONYMS_DB_URL: 전용 동의어 DB
+      - SYN_FUZZY_LIMIT (기본 5), SYN_FUZZY_THRESHOLD (기본 0.30)
+      - SYN_EXPAND (true/false, 기본 true): 토큰별 상위 유사어를 괄호 OR 확장
+    """
+    def __init__(self, db_url: str | None = None):
+        self.db_url = db_url or os.getenv("DATABASE_SYN_URL")
+        self.fuzzy_limit = int(os.getenv("SYN_FUZZY_LIMIT", "5"))
+        try:
+            self.fuzzy_threshold = float(os.getenv("SYN_FUZZY_THRESHOLD", "0.30"))
+        except Exception:
+            self.fuzzy_threshold = 0.25
+        self.expand = (os.getenv("SYN_EXPAND", "true").lower() != "false")
+        self._conn = None
+
+        # 간단한 로컬 매핑(최소 폴백). 필요시 자유롭게 확장 가능.
+        self._local_map = {
+            "로얄티": "로열티",
+            "bbq": "비비큐치킨",
+            "스벅": "스타벅스",
+        }
+
+    # 내부: 안전 커넥션 생성
+    def _get_conn(self):
+        if not self.db_url:
+            return None
+        try:
+            import psycopg
+            if self._conn is None:
+                self._conn = psycopg.connect(self.db_url)
+            return self._conn
+        except Exception:
+            return None
+
+    # DB 함수 normalize_text(text) 호출 시도
+    def _db_normalize_text(self, text: str) -> str | None:
+        conn = self._get_conn()
+        if not conn:
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_proc WHERE proname = 'normalize_text' LIMIT 1;")
+                if cur.fetchone() is None:
+                    return None  # 함수 없음
+                cur.execute("SELECT normalize_text(%s);", (text,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0])
+        except Exception:
+            return None
+        return None
+
+    # synonyms 테이블 + pg_trgm 로 토큰별 유사어 후보 가져오기
+    def _db_fuzzy_expand_tokens(self, tokens: list[str]) -> dict[str, list[str]] | None:
+        conn = self._get_conn()
+        if not conn:
+            return None
+        try:
+            with conn.cursor() as cur:
+                # 확장 로드
+                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+                cur.execute("SELECT set_limit(%s);", (self.fuzzy_threshold,))
+
+                out = {}
+                for tok in tokens:
+                    # pg_trgm의 % 연산자는 psycopg에서는 그대로 문자열에 사용 가능 (서버에서 파싱).
+                    sql = """
+                    SELECT DISTINCT syn_group,
+                           GREATEST(similarity(term, %s), similarity(syn_group, %s)) AS score
+                      FROM synonyms
+                     WHERE term % %s OR syn_group % %s
+                     ORDER BY score DESC
+                     LIMIT %s;
+                    """
+                    cur.execute(sql, (tok, tok, tok, tok, self.fuzzy_limit))
+                    rows = cur.fetchall()
+                    cands = [r[0] for r in rows if r and r[0]]
+                    if cands:
+                        out[tok] = cands
+                return out
+        except Exception:
+            return None
+
+    def _local_normalize(self, text: str) -> str:
+        out = []
+        for t in text.split():
+            out.append(self._local_map.get(t.lower(), t))
+        return " ".join(out)
+
+    def rewrite(self, text: str) -> str:
+        """최종 재작성된 질의를 반환"""
+        if not text or not text.strip():
+            return text
+
+        # 1) DB normalize_text 시도
+        norm = self._db_normalize_text(text)
+        if norm:
+            text = norm
+
+        # 2) (옵션) 토큰별 fuzzy 후보로 OR 확장
+        if self.expand:
+            tokens = text.split()
+            exp = self._db_fuzzy_expand_tokens(tokens)
+            if exp:
+                new_tokens = []
+                for tok in tokens:
+                    cands = exp.get(tok, [])
+                    # 후보가 있으면 "(tok OR cand1 OR cand2)" 형태로 확장
+                    if cands:
+                        # 중복 제거 및 길이 제한
+                        uniq = [tok] + [c for c in cands if c and c != tok]
+                        new_tokens.append("(" + " OR ".join(uniq[:5]) + ")")
+                    else:
+                        new_tokens.append(tok)
+                text = " ".join(new_tokens)
+
+        # 3) 로컬 간이 치환 폴백
+        text = self._local_normalize(text)
+        return text
 # --------------------
 # 개선된 문서 필터링
 # --------------------
@@ -354,12 +490,14 @@ class GraphState(TypedDict):
 # 개선된 Memory-Aware RAG Chain
 # --------------------
 class MemoryAwareRAGChain:
-    def __init__(self, retriever, llm, get_session_history):
+    def __init__(self, retriever, llm_light, llm, get_session_history):
         self.retriever = retriever
         self.llm = llm
         self.get_session_history = get_session_history
-        self.contextualize_q_chain = CONTEXTUALIZE_QUESTION_PROMPT | llm | StrOutputParser()
+        self.contextualize_q_chain = CONTEXTUALIZE_QUESTION_PROMPT | llm_light | StrOutputParser()
         self.context_extractor = ContextExtractor()
+        # 유사어 정규화/확장기 추가
+        self.synonym_normalizer = SynonymNormalizer()
 
     def invoke(self, input_data: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
         """메모리 기능을 포함한 개선된 RAG 처리"""
@@ -390,8 +528,13 @@ class MemoryAwareRAGChain:
             contextualized_question = question
             print("대화 기록 없음, 원본 질문 사용")
         
-        # 문서 검색 (맥락화된 질문으로)
-        raw_docs = self.retriever.invoke(contextualized_question)
+        # 유사어 기반 재작성(표준화/확장)
+        rewritten_question = self.synonym_normalizer.rewrite(contextualized_question)
+        print(f"유사어 재작성 전: {contextualized_question}")
+        print(f"유사어 재작성 후: {rewritten_question}")
+
+        # 문서 검색 (재작성된 질문으로)
+        raw_docs = self.retriever.invoke(rewritten_question)
         print(f"검색된 원본 문서 수: {len(raw_docs)}")
         
         # 스마트 필터링 적용
@@ -452,6 +595,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL 환경 변수가 설정되지 않았습니다.")
 
+# PostgreSQL 연결 정보
+DATABASE_URL_SYN = os.getenv("DATABASE_SYN_URL")
+if not DATABASE_URL_SYN:
+    raise RuntimeError("DATABASE_SYN_URL 환경 변수가 설정되지 않았습니다.")
+
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
     """PostgreSQL 기반 세션 히스토리 반환"""
     return CustomPostgresChatMessageHistory(
@@ -473,9 +621,10 @@ def on_startup():
     embeddings = build_embeddings()
     retriever, collection = build_qdrant_vectorstore(embeddings)
     llm = build_llm()
+    llm_light = build_llm_light()
     
     # 개선된 메모리 인식 RAG 체인 생성
-    app.state.memory_rag_chain = MemoryAwareRAGChain(retriever, llm, get_session_history)
+    app.state.memory_rag_chain = MemoryAwareRAGChain(retriever, llm_light, llm, get_session_history)
     app.state.collection = collection
 
 @app.post("/ask", response_model=AnswerResponse)
