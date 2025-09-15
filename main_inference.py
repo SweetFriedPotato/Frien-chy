@@ -613,7 +613,7 @@ class MemoryAwareRAGChain:
         # 3. 답변 생성 스트리밍
         if not final_docs:
             answer_chunk = "요청하신 정보를 찾을 수 없습니다. 더 구체적인 질문을 해주시면 도움을 드릴 수 있습니다."
-            yield f"data: {json.dumps({'token': answer_chunk})}\n\n"
+            yield f"data: {json.dumps({'token': answer_chunk}, ensure_ascii=False)}\n\n"
             full_answer = answer_chunk
         else:
             ctx = concat_context(final_docs)
@@ -629,7 +629,7 @@ class MemoryAwareRAGChain:
             async for chunk in rag_chain.astream({"question": question}):
                 full_answer += chunk
                 # 각 토큰(chunk)을 SSE 형식으로 클라이언트에 yield
-                yield f"data: {json.dumps({'token': chunk})}\n\n"
+                yield f"data: {json.dumps({'token': chunk}, ensure_ascii=False)}\n\n"
 
         # 4. 스트리밍 종료 후 대화 기록 저장
         history.add_message(HumanMessage(content=question))
