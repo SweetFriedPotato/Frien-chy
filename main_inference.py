@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # main_inference_final.py
-# LangGraph + PostgreSQL Memory 개선 버전
+# LangGraph + PostgreSQL Memory 개선
 
 import os
 import uuid
